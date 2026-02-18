@@ -1,6 +1,9 @@
 import csv
 import os
+import socket
+import subprocess
 import sys
+import time
 from urllib.parse import urlparse
 
 from selenium import webdriver
@@ -31,6 +34,7 @@ OUTPUT_CSV_PATH = r"C:\Users\kruna\OneDrive\Desktop\linkedin_profiles.csv"
 MAX_PAGES = 100
 SCROLL_ROUNDS_PER_PAGE = 8
 WAIT_SECONDS = 30
+CHROME_STARTUP_TIMEOUT_SECONDS = 20
 
 
 # -----------------------------
@@ -73,23 +77,97 @@ def setup_driver() -> webdriver.Chrome:
     """Create a Chrome WebDriver attached to the requested existing Chrome profile."""
     print("[1/9] Preparing Chrome options for existing profile...")
 
-    options = webdriver.ChromeOptions()
-    options.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
-    options.add_argument(f"--profile-directory={CHROME_PROFILE_DIRECTORY}")
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.page_load_strategy = "eager"
+    def build_profile_options() -> webdriver.ChromeOptions:
+        profile_options = webdriver.ChromeOptions()
+        profile_options.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
+        profile_options.add_argument(f"--profile-directory={CHROME_PROFILE_DIRECTORY}")
+        profile_options.add_argument("--start-maximized")
+        profile_options.add_argument("--disable-blink-features=AutomationControlled")
+        profile_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        profile_options.page_load_strategy = "eager"
+        return profile_options
+
+    def find_windows_chrome_binary() -> str:
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return ""
+
+    def find_open_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temp_socket:
+            temp_socket.bind(("127.0.0.1", 0))
+            return int(temp_socket.getsockname()[1])
+
+    def wait_for_debug_port(host: str, port: int, timeout_seconds: int) -> bool:
+        end_time = time.time() + timeout_seconds
+        while time.time() < end_time:
+            try:
+                with socket.create_connection((host, port), timeout=1):
+                    return True
+            except OSError:
+                time.sleep(0.5)
+        return False
 
     print("[2/9] Downloading/locating compatible ChromeDriver (ChromeDriverManager)...")
     chromedriver_path = ChromeDriverManager().install()
     service = Service(chromedriver_path)
 
     print("[3/9] Launching Chrome WebDriver...")
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(90)
-    print("[3/9] Chrome WebDriver launched successfully.")
-    return driver
+    try:
+        driver = webdriver.Chrome(service=service, options=build_profile_options())
+        driver.set_page_load_timeout(90)
+        print("[3/9] Chrome WebDriver launched successfully.")
+        return driver
+    except WebDriverException as first_error:
+        message = str(first_error)
+        if "session not created" not in message.lower():
+            raise
+
+        print("    - Direct profile attach failed. Retrying via remote debugging session...")
+        chrome_binary = find_windows_chrome_binary()
+        if not chrome_binary:
+            raise WebDriverException(
+                "Chrome binary was not found in default install paths. "
+                "Install Chrome or update the chrome path in this script."
+            ) from first_error
+
+        debug_port = find_open_port()
+        launch_command = [
+            chrome_binary,
+            f"--remote-debugging-port={debug_port}",
+            f"--user-data-dir={CHROME_USER_DATA_DIR}",
+            f"--profile-directory={CHROME_PROFILE_DIRECTORY}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ]
+
+        try:
+            subprocess.Popen(launch_command)
+        except Exception as launch_error:
+            raise WebDriverException(
+                f"Could not launch Chrome for remote debugging: {launch_error}"
+            ) from first_error
+
+        if not wait_for_debug_port("127.0.0.1", debug_port, CHROME_STARTUP_TIMEOUT_SECONDS):
+            raise WebDriverException(
+                "Chrome remote debugging endpoint did not become available in time. "
+                "Close existing Chrome windows using this profile and retry."
+            ) from first_error
+
+        attach_options = webdriver.ChromeOptions()
+        attach_options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
+        attach_options.page_load_strategy = "eager"
+
+        driver = webdriver.Chrome(service=service, options=attach_options)
+        driver.set_page_load_timeout(90)
+        print("[3/9] Chrome WebDriver attached successfully through remote debugging.")
+        return driver
 
 
 # -----------------------------
