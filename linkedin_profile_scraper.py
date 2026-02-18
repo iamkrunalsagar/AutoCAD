@@ -30,14 +30,14 @@ CHROME_PROFILE_DIRECTORY = "Profile 7"
 OUTPUT_CSV_PATH = r"C:\Users\kruna\OneDrive\Desktop\linkedin_profiles.csv"
 MAX_PAGES = 100
 SCROLL_ROUNDS_PER_PAGE = 8
-WAIT_SECONDS = 20
+WAIT_SECONDS = 30
 
 
 # -----------------------------
-# Utility Functions
+# URL Helpers
 # -----------------------------
 def is_valid_linkedin_profile_url(url: str) -> bool:
-    """Return True only for clean LinkedIn profile URLs that contain /in/."""
+    """Return True only for valid LinkedIn profile URLs containing /in/."""
     if not url:
         return False
 
@@ -53,59 +53,80 @@ def is_valid_linkedin_profile_url(url: str) -> bool:
         return False
     if "/in/" not in path:
         return False
-    if "?" in url:
-        url = url.split("?", 1)[0]
 
     return True
 
 
 def normalize_profile_url(url: str) -> str:
-    """Normalize LinkedIn profile URLs so deduplication is reliable."""
+    """Normalize LinkedIn profile URL to improve deduplication."""
     if not url:
         return ""
-    cleaned = url.split("?", 1)[0].strip()
+
+    cleaned = url.split("?", 1)[0].split("#", 1)[0].strip()
     return cleaned.rstrip("/")
 
 
+# -----------------------------
+# WebDriver Setup
+# -----------------------------
 def setup_driver() -> webdriver.Chrome:
-    """Create and return a Chrome WebDriver attached to an existing Chrome profile."""
-    print("[1/8] Configuring Chrome options and attaching existing profile...")
+    """Create a Chrome WebDriver attached to the requested existing Chrome profile."""
+    print("[1/9] Preparing Chrome options for existing profile...")
+
     options = webdriver.ChromeOptions()
     options.add_argument(f"--user-data-dir={CHROME_USER_DATA_DIR}")
     options.add_argument(f"--profile-directory={CHROME_PROFILE_DIRECTORY}")
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.page_load_strategy = "eager"
 
-    print("[2/8] Installing/locating compatible ChromeDriver via ChromeDriverManager...")
-    service = Service(ChromeDriverManager().install())
+    print("[2/9] Downloading/locating compatible ChromeDriver (ChromeDriverManager)...")
+    chromedriver_path = ChromeDriverManager().install()
+    service = Service(chromedriver_path)
 
-    print("[3/8] Launching Chrome WebDriver...")
-    return webdriver.Chrome(service=service, options=options)
+    print("[3/9] Launching Chrome WebDriver...")
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(90)
+    print("[3/9] Chrome WebDriver launched successfully.")
+    return driver
 
 
+# -----------------------------
+# LinkedIn Page Load Helpers
+# -----------------------------
 def wait_for_results_to_load(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
-    """Wait for LinkedIn search results to be present and visible."""
-    print("[4/8] Waiting for LinkedIn search results container...")
+    """Wait until LinkedIn results UI and profile links are loaded."""
+    print("[4/9] Waiting for LinkedIn search results page to load...")
 
-    possible_result_locators = [
+    # Confirm we are on a LinkedIn page.
+    wait.until(lambda d: "linkedin.com" in d.current_url.lower())
+
+    # Surface a clear error if LinkedIn redirects to login.
+    if "login" in driver.current_url.lower() or "checkpoint" in driver.current_url.lower():
+        raise TimeoutException(
+            "LinkedIn redirected to login/checkpoint. Please sign in with Profile 7 first and rerun."
+        )
+
+    # Wait for a main search container and at least one profile link.
+    container_locators = [
+        (By.CSS_SELECTOR, "main.scaffold-layout__main"),
         (By.CSS_SELECTOR, "ul.reusable-search__entity-result-list"),
         (By.CSS_SELECTOR, "div.search-results-container"),
-        (By.CSS_SELECTOR, "main.scaffold-layout__main"),
     ]
 
-    loaded = False
-    for locator in possible_result_locators:
+    container_loaded = False
+    for locator in container_locators:
         try:
             wait.until(EC.presence_of_element_located(locator))
-            loaded = True
+            container_loaded = True
             break
         except TimeoutException:
             continue
 
-    if not loaded:
-        raise TimeoutException("Search results did not load within the timeout period.")
+    if not container_loaded:
+        raise TimeoutException("LinkedIn result container was not detected.")
 
-    print("[4/8] Waiting for profile links to appear...")
     wait.until(
         lambda d: len(
             d.find_elements(By.XPATH, "//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')]")
@@ -113,22 +134,21 @@ def wait_for_results_to_load(driver: webdriver.Chrome, wait: WebDriverWait) -> N
         > 0
     )
 
+    print("[4/9] Search results are visible.")
 
-def slow_scroll_results(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
-    """Scroll gradually to trigger dynamic loading of additional profile cards."""
-    print("[5/8] Performing gradual scrolling to load more results...")
-    last_height = 0
 
-    for i in range(1, SCROLL_ROUNDS_PER_PAGE + 1):
+# -----------------------------
+# Scrolling and Extraction
+# -----------------------------
+def slow_scroll_results(driver: webdriver.Chrome) -> None:
+    """Scroll progressively to trigger lazy loading of additional people cards."""
+    print("[5/9] Scrolling page to load more results...")
+
+    for round_index in range(1, SCROLL_ROUNDS_PER_PAGE + 1):
         try:
-            current_height = driver.execute_script("return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);")
-            step_target = int(current_height * (i / SCROLL_ROUNDS_PER_PAGE))
-
-            driver.execute_script(
-                "window.scrollTo({top: arguments[0], behavior: 'smooth'});",
-                step_target,
+            previous_height = driver.execute_script(
+                "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
             )
-
             previous_count = len(
                 driver.find_elements(
                     By.XPATH,
@@ -136,7 +156,14 @@ def slow_scroll_results(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
                 )
             )
 
-            wait.until(
+            target_position = int(previous_height * (round_index / SCROLL_ROUNDS_PER_PAGE))
+            driver.execute_script(
+                "window.scrollTo({top: arguments[0], behavior: 'smooth'});",
+                target_position,
+            )
+
+            # Wait for either more cards or a larger page height.
+            WebDriverWait(driver, 6).until(
                 lambda d: (
                     len(
                         d.find_elements(
@@ -144,181 +171,202 @@ def slow_scroll_results(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
                             "//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')]",
                         )
                     )
-                    >= previous_count
+                    > previous_count
+                    or d.execute_script(
+                        "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
+                    )
+                    > previous_height
                 )
             )
-
-            new_height = driver.execute_script("return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);")
-            print(f"    - Scroll round {i}/{SCROLL_ROUNDS_PER_PAGE} complete.")
-
-            if i > 1 and new_height == last_height:
-                print("    - Page height stabilized; continuing to extraction.")
-                break
-
-            last_height = new_height
+            print(f"    - Scroll round {round_index}/{SCROLL_ROUNDS_PER_PAGE} loaded additional content.")
         except TimeoutException:
-            print(f"    - Scroll round {i} timed out while waiting for dynamic content; continuing.")
+            print(f"    - Scroll round {round_index}/{SCROLL_ROUNDS_PER_PAGE} completed (no extra cards detected).")
         except WebDriverException as err:
-            print(f"    - Scroll round {i} encountered WebDriver issue: {err}")
+            print(f"    - Scroll round {round_index}/{SCROLL_ROUNDS_PER_PAGE} WebDriver warning: {err}")
 
+    # Final scroll to the bottom of the page.
     driver.execute_script(
         "window.scrollTo({top: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight), behavior: 'smooth'});"
     )
 
 
 def extract_profile_urls(driver: webdriver.Chrome) -> set:
-    """Extract profile URLs from the current page and return as a set."""
-    page_urls = set()
-    print("[6/8] Extracting profile URLs from current page...")
+    """Extract only LinkedIn profile URLs from current page."""
+    print("[6/9] Extracting profile URLs from current page...")
+    urls = set()
 
     try:
-        anchors = driver.find_elements(By.XPATH, "//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')]")
+        elements = driver.find_elements(
+            By.XPATH,
+            "//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')]",
+        )
     except WebDriverException as err:
-        print(f"    - Failed to collect anchor elements: {err}")
-        return page_urls
+        print(f"    - Unable to fetch link elements: {err}")
+        return urls
 
-    for anchor in anchors:
+    for element in elements:
         try:
-            href = anchor.get_attribute("href")
+            href = element.get_attribute("href")
             if is_valid_linkedin_profile_url(href):
-                page_urls.add(normalize_profile_url(href))
+                urls.add(normalize_profile_url(href))
         except StaleElementReferenceException:
             continue
         except WebDriverException:
             continue
 
-    print(f"    - Found {len(page_urls)} unique profile URL(s) on this page.")
-    return page_urls
+    print(f"    - Collected {len(urls)} unique profile URL(s) from this page.")
+    return urls
 
 
-def click_next_page(driver: webdriver.Chrome, wait: WebDriverWait) -> bool:
-    """Click the next pagination button if available and enabled."""
-    print("[7/8] Checking for next page button...")
+# -----------------------------
+# Pagination
+# -----------------------------
+def click_next_page(driver: webdriver.Chrome) -> bool:
+    """Click next page button if available and enabled."""
+    print("[7/9] Looking for next page button...")
 
-    next_button_candidates = [
-        (By.XPATH, "//button[contains(@aria-label,'Next')]"),
-        (By.XPATH, "//button[contains(@class, 'artdeco-pagination__button--next')]"),
+    xpaths = [
+        "//button[contains(@aria-label,'Next')]",
+        "//button[contains(@class,'artdeco-pagination__button--next')]",
     ]
 
     next_button = None
-    for locator in next_button_candidates:
+    short_wait = WebDriverWait(driver, 8)
+
+    for xpath in xpaths:
         try:
-            next_button = wait.until(EC.presence_of_element_located(locator))
-            if next_button:
+            candidate = short_wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+            if candidate:
+                next_button = candidate
                 break
         except TimeoutException:
             continue
 
     if not next_button:
-        print("    - No next button found. Pagination finished.")
+        print("    - Next button not found. Last page reached.")
         return False
 
-    is_disabled = (
+    disabled = (
         next_button.get_attribute("disabled") is not None
         or next_button.get_attribute("aria-disabled") == "true"
         or "disabled" in (next_button.get_attribute("class") or "").lower()
     )
 
-    if is_disabled:
-        print("    - Next button is disabled. Reached final page.")
+    if disabled:
+        print("    - Next button is disabled. Pagination complete.")
         return False
 
-    old_marker = len(driver.find_elements(By.XPATH, "//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')]"))
+    previous_first_link = ""
+    try:
+        first = driver.find_element(
+            By.XPATH,
+            "(//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')])[1]",
+        )
+        previous_first_link = first.get_attribute("href") or ""
+    except NoSuchElementException:
+        previous_first_link = ""
 
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_button)
-        wait.until(EC.element_to_be_clickable((By.XPATH, "(//button[contains(@aria-label,'Next')])[1]")))
+        WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.XPATH, "(//button[contains(@aria-label,'Next')])[1]")))
         next_button.click()
-        print("    - Clicked next button.")
+        print("    - Next button clicked.")
     except (TimeoutException, WebDriverException) as err:
         print(f"    - Failed to click next button: {err}")
         return False
 
     try:
-        wait.until(
-            lambda d: len(
-                d.find_elements(By.XPATH, "//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')]")
+        WebDriverWait(driver, 15).until(
+            lambda d: (
+                d.current_url != SEARCH_URL
+                or (
+                    (d.find_element(By.XPATH, "(//a[contains(@href, '/in/') and contains(@href, 'linkedin.com')])[1]").get_attribute("href") or "")
+                    != previous_first_link
+                )
             )
-            != old_marker
         )
     except TimeoutException:
-        print("    - Timed out waiting for next page content; continuing cautiously.")
+        print("    - Next page load wait timed out; continuing anyway.")
 
     return True
 
 
+# -----------------------------
+# CSV Output
+# -----------------------------
 def export_to_csv(urls: set) -> None:
-    """Write deduplicated profile URLs into the target CSV file."""
-    print("[8/8] Exporting URLs to CSV...")
+    """Write deduplicated LinkedIn profile URLs to CSV."""
+    print("[8/9] Writing results to CSV...")
+
     output_dir = os.path.dirname(OUTPUT_CSV_PATH)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
     sorted_urls = sorted(urls)
-
-    with open(OUTPUT_CSV_PATH, mode="w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
+    with open(OUTPUT_CSV_PATH, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
         writer.writerow(["linkedin_profile_url"])
         for url in sorted_urls:
             writer.writerow([url])
 
-    print(f"    - Export completed: {len(sorted_urls)} unique URL(s) saved.")
-    print(f"    - File path: {OUTPUT_CSV_PATH}")
+    print(f"    - Saved {len(sorted_urls)} unique URL(s) to: {OUTPUT_CSV_PATH}")
 
 
 # -----------------------------
-# Main Execution Flow
+# Main
 # -----------------------------
-def main() -> None:
+def main() -> int:
+    """Run end-to-end LinkedIn people profile URL scraping flow."""
     driver = None
-    all_profile_urls = set()
+    all_urls = set()
 
     try:
         driver = setup_driver()
         wait = WebDriverWait(driver, WAIT_SECONDS)
 
-        print("Navigating to LinkedIn People search URL...")
+        print("[9/9] Opening LinkedIn People search URL...")
         driver.get(SEARCH_URL)
 
         wait_for_results_to_load(driver, wait)
 
         page_number = 1
         while page_number <= MAX_PAGES:
-            print(f"\n--- Processing page {page_number} ---")
-            slow_scroll_results(driver, wait)
-            page_urls = extract_profile_urls(driver)
-            all_profile_urls.update(page_urls)
-            print(f"Running total unique profile URLs: {len(all_profile_urls)}")
+            print(f"\n--- Scraping page {page_number} ---")
 
-            if not click_next_page(driver, wait):
+            slow_scroll_results(driver)
+            page_urls = extract_profile_urls(driver)
+            all_urls.update(page_urls)
+            print(f"    - Running deduplicated total: {len(all_urls)}")
+
+            if not click_next_page(driver):
                 break
 
             wait_for_results_to_load(driver, wait)
             page_number += 1
 
-        export_to_csv(all_profile_urls)
+        export_to_csv(all_urls)
         print("Scraping completed successfully.")
+        return 0
 
     except TimeoutException as err:
         print(f"ERROR: Timeout while waiting for LinkedIn elements: {err}")
-        if all_profile_urls:
-            export_to_csv(all_profile_urls)
     except NoSuchElementException as err:
-        print(f"ERROR: Required page element was not found: {err}")
-        if all_profile_urls:
-            export_to_csv(all_profile_urls)
+        print(f"ERROR: Missing expected page element: {err}")
     except WebDriverException as err:
-        print(f"ERROR: WebDriver encountered an issue: {err}")
-        if all_profile_urls:
-            export_to_csv(all_profile_urls)
+        print(f"ERROR: WebDriver failure: {err}")
     except Exception as err:
-        print(f"ERROR: Unexpected failure occurred: {err}")
-        if all_profile_urls:
-            export_to_csv(all_profile_urls)
+        print(f"ERROR: Unexpected failure: {err}")
     finally:
+        if all_urls:
+            try:
+                export_to_csv(all_urls)
+            except Exception as export_err:
+                print(f"WARNING: Could not export partial results: {export_err}")
         if driver is not None:
             print("Closing browser...")
             driver.quit()
+
+    return 1
 
 
 if __name__ == "__main__":
